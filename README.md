@@ -5,9 +5,11 @@
 M25P40 属于 SPI NOR Flash，因此模型采用 NOR 结构：
 
 ```text
-FlashChip -> Sector -> Page
+FTL / Controller -> FlashCore -> FlashChip -> Sector -> Page
 8 sectors, 256 pages/sector, 256 bytes/page, total 512KiB
 ```
+
+本项目保留 `FTL` 层作为上层 controller 抽象。它负责命令排队、简单 LBA 到字节地址映射、`WAIT` 调度和驱动 `FlashCore` 顺序执行；完整磨损均衡、垃圾回收和复杂映射策略可以在这一层继续扩展。
 
 已实现的主要行为：
 
@@ -24,6 +26,9 @@ FlashChip -> Sector -> Page
 - Deep Power-Down / Release / Read Electronic Signature
 - JEDEC ID：`20 20 13`，RES：`12`
 - 事件驱动 busy 模式，支持 `WAIT` 和 busy 中 `READ_STATUS` 轮询
+- 启动时从 `storage_m25p.bin` 同步阵列内容到内存镜像
+- 配置合法性检查，避免非法页大小、容量、频率或时间参数破坏模型
+- `WRAP_ADDRESS=0` 时拒绝越界读写擦命令
 
 构建与运行：
 
@@ -34,4 +39,5 @@ make run
 
 默认配置文件为 `m25p.conf`，默认阵列文件为 `storage_m25p.bin`。
 
-该版本计入了FLASH接口、少数封装带来的约束。计入了状态寄存器、WEL
+该版本计入了 Flash 接口、少数封装带来的约束，也计入了状态寄存器、WEL/WIP、保护位和 Deep Power-Down 等芯片级行为。
+未验证！！！！！！！

@@ -5,6 +5,10 @@
 
 using namespace std;
 
+static bool is_power_of_two(int value) {
+    return value > 0 && (value & (value - 1)) == 0;
+}
+
 // 默认参数直接对应 M25P40 的常用规格：
 // 8 个 64KiB sector，每个 sector 256 页，每页 256B，总容量 512KiB。
 // 即使配置文件缺失，模型也能使用这组默认值运行。
@@ -94,6 +98,52 @@ FlashConfig load_config(const std::string& filename) {
         else if (key == "AUTO_COMPLETE") cfg.auto_complete = (int)val;
         else if (key == "WRAP_ADDRESS") cfg.wrap_address = (int)val;
         else if (key == "STORAGE_FILE") cfg.storage_file = str_val;
+    }
+
+    if (!is_power_of_two(cfg.page_size)) {
+        cerr << "[警告] PAGE_SIZE 必须为正的 2 的幂，恢复默认值 256" << endl;
+        cfg.page_size = 256;
+    }
+    if (cfg.page_per_sector <= 0) {
+        cerr << "[警告] PAGE_PER_SECTOR 非法，恢复默认值 256" << endl;
+        cfg.page_per_sector = 256;
+    }
+    if (cfg.sector_count <= 0) {
+        cerr << "[警告] SECTOR_COUNT 非法，恢复默认值 8" << endl;
+        cfg.sector_count = 8;
+    }
+    if (cfg.f_c_mhz <= 0.0) {
+        cerr << "[警告] F_C_MHZ 非法，恢复默认值 75MHz" << endl;
+        cfg.f_c_mhz = 75.0;
+    }
+    if (cfg.f_r_mhz <= 0.0) {
+        cerr << "[警告] F_R_MHZ 非法，恢复默认值 33MHz" << endl;
+        cfg.f_r_mhz = 33.0;
+    }
+    if (cfg.t_prog_us < 0.0) cfg.t_prog_us = 0.0;
+    if (cfg.t_prog_max_us < cfg.t_prog_us) cfg.t_prog_max_us = cfg.t_prog_us;
+    if (cfg.t_prog_chunk_us <= 0.0) cfg.t_prog_chunk_us = 25.0;
+    if (cfg.t_erase_sector_us < 0.0) cfg.t_erase_sector_us = 0.0;
+    if (cfg.t_erase_sector_max_us < cfg.t_erase_sector_us) {
+        cfg.t_erase_sector_max_us = cfg.t_erase_sector_us;
+    }
+    if (cfg.t_erase_bulk_us < 0.0) cfg.t_erase_bulk_us = 0.0;
+    if (cfg.t_erase_bulk_max_us < cfg.t_erase_bulk_us) {
+        cfg.t_erase_bulk_max_us = cfg.t_erase_bulk_us;
+    }
+    if (cfg.t_w_us < 0.0) cfg.t_w_us = 0.0;
+    if (cfg.t_w_max_us < cfg.t_w_us) cfg.t_w_max_us = cfg.t_w_us;
+    if (cfg.t_dpd_us < 0.0) cfg.t_dpd_us = 0.0;
+    if (cfg.t_res_us < 0.0) cfg.t_res_us = 0.0;
+    if (cfg.t_shsl_us < 0.0) cfg.t_shsl_us = 0.0;
+    if (cfg.t_vsl_us < 0.0) cfg.t_vsl_us = 0.0;
+    if (cfg.t_puw_us < 0.0) cfg.t_puw_us = 0.0;
+    cfg.use_max_time = cfg.use_max_time ? 1 : 0;
+    cfg.auto_complete = cfg.auto_complete ? 1 : 0;
+    cfg.wrap_address = cfg.wrap_address ? 1 : 0;
+    if (cfg.storage_file.empty()) {
+        cerr << "[警告] STORAGE_FILE 为空，恢复默认值 storage_m25p.bin" << endl;
+        cfg.storage_file = "storage_m25p.bin";
     }
 
     // 保证派生字段和基础几何字段一致，避免配置文件里的 TOTAL_PAGES/MEMORY_SIZE

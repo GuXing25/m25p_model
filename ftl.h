@@ -8,13 +8,14 @@
 
 class FTL {
 private:
-    // FTL 是一个很薄的事件调度层：它不直接改 Flash，只负责把命令排队。
+    // 本项目保留 FTL 作为上层 controller：它不直接改 Flash，
+    // 而是负责命令排队、简单 LBA 映射和仿真时间调度。
     FlashCore& core;
     const FlashConfig& cfg;
     std::queue<FlashEvent> q;
 
-    // 简单 LBA->字节地址映射表。这里没有实现真实磨损均衡，只是为了
-    // 给上层提供按页 LBA 提交命令的兼容入口。
+    // 简单 LBA->字节地址映射表。当前还不是完整 SSD FTL，
+    // 但保留该层便于后续扩展 controller 策略、磨损统计或映射策略。
     std::unordered_map<int, int> map;
 
 public:

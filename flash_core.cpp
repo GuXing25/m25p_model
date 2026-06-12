@@ -80,8 +80,21 @@ void FlashCore::init_storage() {
         }
     }
 
+    sync_storage_to_chip();
     cout << "[信息] M25P40 存储文件已挂载" << endl;
     cout << "[时间] 初始时间：" << current_operation_time << "us" << endl;
+}
+
+void FlashCore::sync_storage_to_chip() {
+    if (!storage_file.is_open()) return;
+
+    storage_file.clear();
+    for (int s = 0; s < cfg.sector_count; s++) {
+        for (int p = 0; p < cfg.page_per_sector; p++) {
+            update_page_status(s, p);
+        }
+    }
+    storage_file.clear();
 }
 
 int FlashCore::sector_size() const {
@@ -97,6 +110,15 @@ int FlashCore::normalize_addr(int addr) const {
     int a = addr % cfg.memory_size;
     if (a < 0) a += cfg.memory_size;
     return a;
+}
+
+bool FlashCore::address_range_valid(int addr, int len) const {
+    if (cfg.wrap_address) return true;
+    if (len < 0) return false;
+    long long start = addr;
+    long long bytes = max(1, len);
+    long long end = start + bytes;
+    return start >= 0 && end <= cfg.memory_size;
 }
 
 // M25P40地址解析：字节地址 -> Sector / Page / Offset
@@ -212,6 +234,7 @@ void FlashCore::add_time(double us) {
 
 void FlashCore::read_bytes(int addr, uint8_t* buf, int len) {
     if (buf == nullptr || len <= 0) return;
+    if (!address_range_valid(addr, len)) return;
     storage_file.clear();
     for (int i = 0; i < len; i++) {
         // 按字节读取可以直接支持跨页、跨 sector 和容量回卷。
@@ -484,6 +507,12 @@ void FlashCore::execute_read(FlashEvent& event, bool fast) {
         add_time(command_bus_time(event));
         return;
     }
+    if (!address_range_valid(event.getAddr(), len)) {
+        cerr << "[错误] READ 地址越界：Addr=0x" << hex << uppercase << event.getAddr()
+             << dec << nouppercase << " Len=" << len << endl;
+        add_time(command_bus_time(event));
+        return;
+    }
     // READ 和 FAST_READ 都从 storage_file 后端读取；区别在于总线命令长度和频率。
     read_bytes(event.getAddr(), event.getBuf(), len);
     add_time(command_bus_time(event));
@@ -512,6 +541,13 @@ void FlashCore::execute_page_program(FlashEvent& event) {
 
     int sector, page, offset;
     parse_address(event.getAddr(), sector, page, offset);
+    if (!address_range_valid(event.getAddr(), 1)) {
+        cerr << "[错误] PAGE PROGRAM 地址越界：Addr=0x" << hex << uppercase << event.getAddr()
+             << dec << nouppercase << endl;
+        set_wel(false);
+        add_time(command_bus_time(event));
+        return;
+    }
     if (sector_protected(sector)) {
         // BP 位保护的是高地址区域；目标 sector 被保护时，本次编程拒绝。
         cerr << "[警告] PAGE PROGRAM 被拒绝：目标 Sector=" << sector << " 受 BP 保护" << endl;
@@ -546,6 +582,13 @@ void FlashCore::execute_sector_erase(FlashEvent& event) {
 
     int sector, page, offset;
     parse_address(event.getAddr(), sector, page, offset);
+    if (!address_range_valid(event.getAddr(), 1)) {
+        cerr << "[错误] SECTOR ERASE 地址越界：Addr=0x" << hex << uppercase << event.getAddr()
+             << dec << nouppercase << endl;
+        set_wel(false);
+        add_time(command_bus_time(event));
+        return;
+    }
     if (sector_protected(sector) || hardware_protected()) {
         // sector_protected 来自 BP 位；hardware_protected 来自 SRWD + W#。
         cerr << "[警告] SECTOR ERASE 被拒绝：Sector=" << sector << " 受保护" << endl;

@@ -10,7 +10,13 @@ int FTL::map_lba(int lba) {
     // lba 超过总页数时取模回卷，和底层 wrap_address 的思想保持一致。
     if (map.find(lba) == map.end()) {
         int total = cfg.total_pages;
-        map[lba] = (lba % total) * cfg.page_size;
+        if (total <= 0) {
+            cerr << "[错误] LBA 映射失败：total_pages 非法" << endl;
+            return 0;
+        }
+        int page = lba % total;
+        if (page < 0) page += total;
+        map[lba] = page * cfg.page_size;
     }
     return map[lba];
 }

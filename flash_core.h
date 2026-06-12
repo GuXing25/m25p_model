@@ -55,9 +55,11 @@ private:
 
     // 地址、后端文件和保护状态辅助函数。
     void init_storage();
+    void sync_storage_to_chip();
     void parse_address(int addr, int& sector, int& page, int& offset);
     int normalize_addr(int addr) const;
     int sector_size() const;
+    bool address_range_valid(int addr, int len) const;
 
     // 状态寄存器读写和保护判断。
     bool is_wip() const;
