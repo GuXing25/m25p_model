@@ -8,6 +8,8 @@
 
 using namespace std;
 
+// 打印读出或写入的数据摘要。为了避免测试输出过长，只显示前 32 字节；
+// 完整数据仍然保存在调用者提供的 buffer 或 storage_file 中。
 static void print_data_hex(const char* title, const uint8_t* data, int len) {
     cout << title << " (" << len << " bytes):" << endl;
     if (data == nullptr || len <= 0) {
@@ -23,14 +25,19 @@ static void print_data_hex(const char* title, const uint8_t* data, int len) {
     if (len > shown) cout << "..." << endl;
 }
 
+// PendingOperation 的默认态表示“没有正在进行的内部自定时周期”。
+// type 给一个合法默认值即可，只有 active=true 时才会被读取。
 PendingOperation::PendingOperation()
     : active(false), type(READ), addr(0), len(0), complete_time(0.0), sr_value(0) {}
 
+// FlashCore 构造时立即挂载或创建后端存储文件，使后续 READ/PP/ERASE
+// 都能通过同一个文件镜像模拟非易失存储。
 FlashCore::FlashCore(FlashChip& c, const FlashConfig& conf)
     : chip(c), cfg(conf), current_operation_time(0.0) {
     init_storage();
 }
 
+// 析构时刷新并关闭文件，确保最后一次写/擦除已经落到磁盘镜像中。
 FlashCore::~FlashCore() {
     if (storage_file.is_open()) {
         storage_file.flush();
@@ -43,6 +50,8 @@ void FlashCore::init_storage() {
     storage_file.open(cfg.storage_file, ios::in | ios::out | ios::binary);
     if (!storage_file.is_open()) {
         cout << "[信息] 未找到 " << cfg.storage_file << "，创建新文件..." << endl;
+        // 新建文件时按页写入 0xFF。NOR Flash 的擦除态为 1，
+        // 所以空芯片镜像不能初始化成 0x00。
         storage_file.open(cfg.storage_file, ios::out | ios::binary | ios::trunc);
         if (!storage_file.is_open()) {
             cerr << "[错误] 创建 " << cfg.storage_file << " 失败！" << endl;
@@ -58,6 +67,7 @@ void FlashCore::init_storage() {
         storage_file.seekg(0, ios::end);
         streamoff size = storage_file.tellg();
         if (size < cfg.memory_size) {
+            // 文件存在但容量不足时直接重建，避免后续 seek/read 落到文件尾之外。
             cout << "[警告] 存储文件容量不足，重新初始化为擦除态" << endl;
             storage_file.close();
             storage_file.open(cfg.storage_file, ios::out | ios::binary | ios::trunc);
@@ -75,12 +85,15 @@ void FlashCore::init_storage() {
 }
 
 int FlashCore::sector_size() const {
+    // 每个 sector 的字节数 = 每页字节数 * 每个 sector 的页数。
     return cfg.page_size * cfg.page_per_sector;
 }
 
 int FlashCore::normalize_addr(int addr) const {
     if (cfg.memory_size <= 0) return 0;
     if (!cfg.wrap_address) return addr;
+    // M25P40 地址是 24-bit 命令地址，但当前模型按实际容量回卷。
+    // 负地址也做一次正向归一化，防止 C++ % 产生负余数。
     int a = addr % cfg.memory_size;
     if (a < 0) a += cfg.memory_size;
     return a;
@@ -96,28 +109,34 @@ void FlashCore::parse_address(int addr, int& sector, int& page, int& offset) {
 }
 
 bool FlashCore::is_wip() const {
+    // WIP=1 表示写状态寄存器、页编程或擦除仍处于内部自定时周期。
     return (chip.status_reg & SR_WIP) != 0;
 }
 
 bool FlashCore::is_wel() const {
+    // WEL 只能由 WRITE_ENABLE 置位，并会在写/擦除类命令启动或拒绝后清零。
     return (chip.status_reg & SR_WEL) != 0;
 }
 
 int FlashCore::bp_value() const {
+    // BP2..BP0 位于状态寄存器 bit4..bit2，组合决定受保护的高地址区域。
     return (chip.status_reg >> 2) & 0x07;
 }
 
 void FlashCore::set_wip(bool v) {
+    // 只改 WIP 位，保留 BP/SRWD/WEL 等其他状态位。
     if (v) chip.status_reg |= SR_WIP;
     else chip.status_reg &= ~SR_WIP;
 }
 
 void FlashCore::set_wel(bool v) {
+    // 只改 WEL 位，避免影响保护位和 WIP。
     if (v) chip.status_reg |= SR_WEL;
     else chip.status_reg &= ~SR_WEL;
 }
 
 bool FlashCore::hardware_protected() const {
+    // SRWD=1 且 W# 引脚为低电平时，状态寄存器写保护生效。
     return ((chip.status_reg & SR_SRWD) != 0) && chip.write_protect_low;
 }
 
@@ -153,6 +172,8 @@ double FlashCore::page_program_time_us(int n) const {
 
 double FlashCore::command_bus_time(const FlashEvent& event) const {
     int len = max(0, event.getLen());
+    // 这里计算的是命令在 SPI 总线上“移位传输”的时间，不包含内部自定时周期。
+    // 例如 PAGE_PROGRAM = 8bit opcode + 24bit addr + N*8bit data。
     switch (event.getType()) {
         case WRITE_ENABLE:
         case WRITE_DISABLE:
@@ -182,6 +203,8 @@ double FlashCore::command_bus_time(const FlashEvent& event) const {
 }
 
 void FlashCore::add_time(double us) {
+    // 所有命令都通过 add_time 推进全局时钟。推进之后立即检查 pending，
+    // 因此 READ_STATUS/WAIT 等命令可以自然触发内部周期完成。
     current_operation_time += us;
     complete_pending_if_ready();
     chip.time = current_operation_time;
@@ -191,6 +214,7 @@ void FlashCore::read_bytes(int addr, uint8_t* buf, int len) {
     if (buf == nullptr || len <= 0) return;
     storage_file.clear();
     for (int i = 0; i < len; i++) {
+        // 按字节读取可以直接支持跨页、跨 sector 和容量回卷。
         int a = normalize_addr(addr + i);
         storage_file.seekg(a);
         char ch = (char)0xFF;
@@ -202,12 +226,15 @@ void FlashCore::read_bytes(int addr, uint8_t* buf, int len) {
 void FlashCore::read_status(uint8_t* buf, int len) {
     if (buf == nullptr || len <= 0) return;
     for (int i = 0; i < len; i++) {
+        // M25P40 状态寄存器 bit6、bit5 读出为 0，故用 0x9F 屏蔽。
         buf[i] = chip.status_reg & 0x9F; // b6,b5 固定读 0
     }
 }
 
 void FlashCore::read_id(uint8_t* buf, int len) {
     if (buf == nullptr || len <= 0) return;
+    // JEDEC ID 前 3 字节：Manufacturer=0x20, Memory Type=0x20, Capacity=0x13。
+    // 后续字节用固定表循环填充，方便测试一次性读取较长长度。
     uint8_t id[20] = {
         0x20, 0x20, 0x13, 0x10,
         0x00, 0x00, 0x00, 0x00,
@@ -222,6 +249,7 @@ void FlashCore::read_id(uint8_t* buf, int len) {
 
 void FlashCore::read_signature(uint8_t* buf, int len) {
     if (buf == nullptr || len <= 0) return;
+    // RES 命令返回 M25P40 的 electronic signature：0x12。
     for (int i = 0; i < len; i++) {
         buf[i] = 0x12;
     }
@@ -238,8 +266,12 @@ bool FlashCore::start_pending(EventType type, int addr, int len,
         return false;
     }
 
+    // 先消耗 SPI 总线传输时间。命令移位完成后，芯片才进入内部自定时周期。
     add_time(bus_time_us);
 
+    // 把会在内部周期结束时真正应用的信息保存下来。
+    // PAGE_PROGRAM 保存一整页缓冲区和有效字节 mask；
+    // ERASE 不需要 data；WRITE_STATUS 使用 sr_value。
     pending.active = true;
     pending.type = type;
     pending.addr = normalize_addr(addr);
@@ -251,6 +283,8 @@ bool FlashCore::start_pending(EventType type, int addr, int len,
 
     set_wip(true);
     set_wel(false); // 手册说周期完成前某时刻复位；模型中启动即复位
+    // FlashChip 的 busy/state 是对外可见的高层状态，WIP 是状态寄存器位。
+    // 两者同时维护，便于旧接口和 M25P40 命令接口都能观察忙状态。
     chip.busy = true;
     chip.state = BUSY;
     chip.time = current_operation_time;
@@ -259,6 +293,8 @@ bool FlashCore::start_pending(EventType type, int addr, int len,
          << fixed << setprecision(3) << pending.complete_time << "us" << endl;
 
     if (cfg.auto_complete) {
+        // 兼容原仓库“阻塞式”风格：命令启动后直接跳到完成时间。
+        // auto_complete=0 时，用户需要通过 WAIT 或后续命令推进时间。
         current_operation_time = pending.complete_time;
         complete_pending_if_ready();
     }
@@ -269,6 +305,7 @@ void FlashCore::complete_pending_if_ready() {
     if (!pending.active) return;
     if (current_operation_time + 1e-9 < pending.complete_time) return;
 
+    // 到达 complete_time 后才修改阵列或状态寄存器，模拟芯片内部周期完成。
     switch (pending.type) {
         case PAGE_PROGRAM:
             apply_page_program();
@@ -289,6 +326,7 @@ void FlashCore::complete_pending_if_ready() {
     pending = PendingOperation();
     set_wip(false);
     set_wel(false);
+    // 内部周期结束后回到 IDLE；如果芯片之前处于 DPD，则保持 DPD。
     chip.busy = false;
     chip.state = chip.deep_power_down ? DEEP_POWER_DOWN : IDLE;
     chip.time = current_operation_time;
@@ -308,9 +346,12 @@ void FlashCore::apply_page_program() {
         storage_file.seekg(off);
         char old_ch = (char)0xFF;
         storage_file.read(&old_ch, 1);
+        // NOR Flash 编程只能把 bit 从 1 写成 0，不能把 0 写回 1。
+        // 因此新值必须是旧值和输入数据逐 bit 相与；恢复 1 只能先擦除。
         uint8_t new_ch = ((uint8_t)old_ch) & pending.data[i]; // NOR 只允许 1 -> 0
         storage_file.seekp(off);
         storage_file.write((char*)&new_ch, 1);
+        // 同步更新内存镜像，避免后续直接查看 chip.sectors 时和文件后端不一致。
         chip.sectors[sector]->pages[page]->data[i] = new_ch;
     }
     storage_file.flush();
@@ -326,12 +367,14 @@ void FlashCore::apply_sector_erase() {
     vector<uint8_t> erase_data(cfg.page_size, 0xFF);
 
     storage_file.clear();
+    // Sector Erase 是 M25P40 的最小擦除操作：整个 64KiB sector 恢复为 0xFF。
     for (int p = 0; p < cfg.page_per_sector; p++) {
         int off = base + p * cfg.page_size;
         storage_file.seekp(off);
         storage_file.write((char*)erase_data.data(), cfg.page_size);
     }
     storage_file.flush();
+    // 同步内存镜像的 page data/status。
     chip.sectors[sector]->erase();
     cout << "[硬件(M25P40)] Sector Erase 完成：Sector=" << sector << endl;
 }
@@ -340,6 +383,7 @@ void FlashCore::apply_bulk_erase() {
     vector<uint8_t> erase_data(cfg.page_size, 0xFF);
     storage_file.clear();
     storage_file.seekp(0);
+    // Bulk Erase 会擦除整片阵列，要求没有 BP 保护且硬件保护未生效。
     for (int i = 0; i < cfg.total_pages; i++) {
         storage_file.write((char*)erase_data.data(), cfg.page_size);
     }
@@ -351,6 +395,8 @@ void FlashCore::apply_bulk_erase() {
 }
 
 void FlashCore::apply_write_status() {
+    // WRITE STATUS 只允许写 SRWD 和 BP2..BP0。
+    // WIP/WEL 是内部状态位，不应被外部写入数据直接覆盖。
     uint8_t keep = chip.status_reg & (SR_WIP | SR_WEL);
     uint8_t writable = pending.sr_value & (SR_SRWD | SR_BP2 | SR_BP1 | SR_BP0);
     chip.status_reg = keep | writable;
@@ -364,6 +410,8 @@ void FlashCore::update_page_status(int sector, int page) {
     int base = (sector * cfg.page_per_sector + page) * cfg.page_size;
     storage_file.clear();
     storage_file.seekg(base);
+    // 从文件后端回读整页，重建 Page::data 和 FREE/VALID 状态。
+    // 只要出现非 0xFF 字节，就认为该页已被编程。
     for (int i = 0; i < cfg.page_size; i++) {
         char ch = 0x00;
         storage_file.read(&ch, 1);
@@ -374,12 +422,15 @@ void FlashCore::update_page_status(int sector, int page) {
 }
 
 void FlashCore::execute_write_enable() {
+    // WREN 本身只有一个 opcode，总线时间很短；执行后置位 WEL。
+    // 后续写状态、页编程、擦除类命令都会检查这个 latch。
     add_time(command_bus_time(FlashEvent(WRITE_ENABLE, 0, current_operation_time, cfg)));
     set_wel(true);
     cout << "[命令] WRITE ENABLE：WEL=1" << endl;
 }
 
 void FlashCore::execute_write_disable() {
+    // WRDI 清除 WEL，用于显式取消写/擦除授权。
     add_time(command_bus_time(FlashEvent(WRITE_DISABLE, 0, current_operation_time, cfg)));
     set_wel(false);
     cout << "[命令] WRITE DISABLE：WEL=0" << endl;
@@ -387,6 +438,8 @@ void FlashCore::execute_write_disable() {
 
 void FlashCore::execute_read_status(FlashEvent& event) {
     int len = max(1, event.getLen());
+    // RDSR 是 WIP=1 期间唯一允许执行的轮询命令。
+    // 如果 len>1，M25P40 会重复输出状态寄存器值。
     read_status(event.getBuf(), event.getLen());
     add_time(command_bus_time(event));
     if (event.getBuf() != nullptr && event.getLen() > 0) {
@@ -399,11 +452,13 @@ void FlashCore::execute_read_status(FlashEvent& event) {
 
 void FlashCore::execute_write_status(FlashEvent& event) {
     if (!is_wel()) {
+        // Datasheet 行为：没有先 WREN 时，写状态寄存器命令被忽略。
         cerr << "[警告] WRITE STATUS 被忽略：WEL=0" << endl;
         add_time(command_bus_time(event));
         return;
     }
     if (hardware_protected()) {
+        // SRWD=1 且 W#=LOW 时，状态寄存器保护位不能被改写。
         cerr << "[警告] WRITE STATUS 被拒绝：SRWD=1 且 W#=LOW，硬件保护生效" << endl;
         set_wel(false);
         add_time(command_bus_time(event));
@@ -417,6 +472,7 @@ void FlashCore::execute_write_status(FlashEvent& event) {
 
     uint8_t new_sr = event.getBuf()[0];
     double t = cfg.use_max_time ? cfg.t_w_max_us : cfg.t_w_us;
+    // 写状态寄存器也有内部周期，因此进入 pending，而不是立即修改 SR。
     start_pending(WRITE_STATUS, 0, 1, vector<uint8_t>(), vector<uint8_t>(), new_sr,
                   command_bus_time(event), t);
 }
@@ -428,6 +484,7 @@ void FlashCore::execute_read(FlashEvent& event, bool fast) {
         add_time(command_bus_time(event));
         return;
     }
+    // READ 和 FAST_READ 都从 storage_file 后端读取；区别在于总线命令长度和频率。
     read_bytes(event.getAddr(), event.getBuf(), len);
     add_time(command_bus_time(event));
 
@@ -442,6 +499,7 @@ void FlashCore::execute_read(FlashEvent& event, bool fast) {
 
 void FlashCore::execute_page_program(FlashEvent& event) {
     if (!is_wel()) {
+        // PP 必须先执行 WREN；被忽略时仍消耗命令总线时间。
         cerr << "[警告] PAGE PROGRAM 被忽略：WEL=0" << endl;
         add_time(command_bus_time(event));
         return;
@@ -455,6 +513,7 @@ void FlashCore::execute_page_program(FlashEvent& event) {
     int sector, page, offset;
     parse_address(event.getAddr(), sector, page, offset);
     if (sector_protected(sector)) {
+        // BP 位保护的是高地址区域；目标 sector 被保护时，本次编程拒绝。
         cerr << "[警告] PAGE PROGRAM 被拒绝：目标 Sector=" << sector << " 受 BP 保护" << endl;
         set_wel(false);
         add_time(command_bus_time(event));
@@ -464,6 +523,8 @@ void FlashCore::execute_page_program(FlashEvent& event) {
     vector<uint8_t> page_buffer(cfg.page_size, 0xFF);
     vector<uint8_t> valid(cfg.page_size, 0);
     int pos = offset;
+    // M25P40 Page Program 不跨页。超过页尾的数据会回卷到同一页开头，
+    // 因此这里构造一整页缓冲区，并用 valid 标记本次真正触碰的位置。
     for (int i = 0; i < event.getLen(); i++) {
         page_buffer[pos] = event.getBuf()[i];
         valid[pos] = 1;
@@ -477,6 +538,7 @@ void FlashCore::execute_page_program(FlashEvent& event) {
 
 void FlashCore::execute_sector_erase(FlashEvent& event) {
     if (!is_wel()) {
+        // 擦除同样需要 WEL=1。
         cerr << "[警告] SECTOR ERASE 被忽略：WEL=0" << endl;
         add_time(command_bus_time(event));
         return;
@@ -485,6 +547,7 @@ void FlashCore::execute_sector_erase(FlashEvent& event) {
     int sector, page, offset;
     parse_address(event.getAddr(), sector, page, offset);
     if (sector_protected(sector) || hardware_protected()) {
+        // sector_protected 来自 BP 位；hardware_protected 来自 SRWD + W#。
         cerr << "[警告] SECTOR ERASE 被拒绝：Sector=" << sector << " 受保护" << endl;
         set_wel(false);
         add_time(command_bus_time(event));
@@ -492,6 +555,7 @@ void FlashCore::execute_sector_erase(FlashEvent& event) {
     }
 
     double t = cfg.use_max_time ? cfg.t_erase_sector_max_us : cfg.t_erase_sector_us;
+    // Sector Erase 内部时间远大于命令总线时间，因此通过 pending 暴露 WIP。
     start_pending(SECTOR_ERASE, event.getAddr(), 0, vector<uint8_t>(), vector<uint8_t>(), 0,
                   command_bus_time(event), t);
 }
@@ -503,6 +567,7 @@ void FlashCore::execute_bulk_erase(FlashEvent& event) {
         return;
     }
     if (bp_value() != 0 || hardware_protected()) {
+        // Bulk Erase 只有在整片都未被保护时才允许执行。
         cerr << "[警告] BULK ERASE 被拒绝：BP!=000 或硬件保护生效" << endl;
         set_wel(false);
         add_time(command_bus_time(event));
@@ -510,11 +575,14 @@ void FlashCore::execute_bulk_erase(FlashEvent& event) {
     }
 
     double t = cfg.use_max_time ? cfg.t_erase_bulk_max_us : cfg.t_erase_bulk_us;
+    // Bulk Erase 覆盖整片阵列，完成时 apply_bulk_erase() 统一写回文件和内存镜像。
     start_pending(BULK_ERASE, 0, 0, vector<uint8_t>(), vector<uint8_t>(), 0,
                   command_bus_time(event), t);
 }
 
 void FlashCore::execute_deep_power_down() {
+    // DPD 命令包含 opcode 传输时间和进入低功耗模式的 tDP 时间。
+    // 进入后，大多数命令会在 execute() 的统一入口被忽略。
     FlashEvent tmp(DEEP_POWER_DOWN_CMD, 0, current_operation_time, cfg);
     add_time(command_bus_time(tmp) + cfg.t_dpd_us);
     chip.deep_power_down = true;
@@ -523,6 +591,7 @@ void FlashCore::execute_deep_power_down() {
 }
 
 void FlashCore::execute_release_power_down() {
+    // Release 命令退出 DPD，并消耗 tRES 恢复时间。
     FlashEvent tmp(RELEASE_POWER_DOWN, 0, current_operation_time, cfg);
     add_time(command_bus_time(tmp) + cfg.t_res_us);
     chip.deep_power_down = false;
@@ -531,6 +600,7 @@ void FlashCore::execute_release_power_down() {
 }
 
 void FlashCore::execute_read_id(FlashEvent& event) {
+    // READ ID 不依赖存储阵列内容，直接返回固定 JEDEC ID。
     read_id(event.getBuf(), event.getLen());
     add_time(command_bus_time(event));
     if (event.getBuf() != nullptr && event.getLen() > 0) {
@@ -540,6 +610,7 @@ void FlashCore::execute_read_id(FlashEvent& event) {
 }
 
 void FlashCore::execute_read_signature(FlashEvent& event) {
+    // RES 命令既可以读取 electronic signature，也可以从 DPD 中唤醒芯片。
     bool was_dpd = chip.deep_power_down;
     read_signature(event.getBuf(), event.getLen());
     add_time(command_bus_time(event) + (was_dpd ? cfg.t_res_us : 0.0));
@@ -554,12 +625,16 @@ void FlashCore::execute_read_signature(FlashEvent& event) {
 }
 
 void FlashCore::execute_wait(FlashEvent& event) {
+    // WAIT 是仿真辅助事件，不改任何寄存器，只推进时间并触发 pending 完成检查。
     add_time(event.getWaitUs());
     cout << "[时间] WAIT " << fixed << setprecision(3) << event.getWaitUs()
          << "us，当前时间：" << current_operation_time << "us" << endl;
 }
 
 void FlashCore::execute(FlashEvent& event) {
+    // 每个命令入口先尝试完成已经到期的内部周期。
+    // 这保证即使没有显式 WAIT，只要后续命令推进时间到达 complete_time，
+    // pending 操作也会被提交。
     complete_pending_if_ready();
 
     if (event.getType() == WAIT) {
@@ -584,6 +659,7 @@ void FlashCore::execute(FlashEvent& event) {
     }
 
     switch (event.getType()) {
+        // 命令分发层只做类型路由；每条命令的合法性和状态变化放在 execute_* 中。
         case WRITE_ENABLE:
             execute_write_enable();
             break;
@@ -635,17 +711,21 @@ void FlashCore::execute(FlashEvent& event) {
 }
 
 double FlashCore::get_time() const {
+    // 对外暴露当前仿真时间，FTL 入队事件和测试打印都会使用它。
     return current_operation_time;
 }
 
 bool FlashCore::is_busy() const {
+    // busy 是旧接口风格的忙状态；M25P40 命令级状态可通过 get_status() 看 WIP。
     return chip.busy;
 }
 
 uint8_t FlashCore::get_status() const {
+    // 与 READ_STATUS 保持一致，屏蔽固定读 0 的 bit6/bit5。
     return chip.status_reg & 0x9F;
 }
 
 void FlashCore::set_write_protect(bool low) {
+    // 模拟外部 W# 引脚电平。low=true 时配合 SRWD=1 可锁定状态寄存器。
     chip.write_protect_low = low;
 }

@@ -5,6 +5,9 @@
 
 using namespace std;
 
+// 默认参数直接对应 M25P40 的常用规格：
+// 8 个 64KiB sector，每个 sector 256 页，每页 256B，总容量 512KiB。
+// 即使配置文件缺失，模型也能使用这组默认值运行。
 FlashConfig::FlashConfig()
     : page_size(256),
       page_per_sector(256),
@@ -45,22 +48,31 @@ FlashConfig load_config(const std::string& filename) {
     string line, key, str_val;
     double val;
     while (getline(file, line)) {
+        // 配置文件采用简单的 "KEY VALUE" 格式；空行和 # 注释行跳过。
         if (line.empty() || line[0] == '#') continue;
         stringstream ss(line);
         ss >> key >> str_val;
         if (key.empty() || str_val.empty()) continue;
 
+        // 大多数字段是数字，STORAGE_FILE 是唯一的字符串字段。
+        // 这里先统一尝试按 double 解析，后面按字段类型再转 int/double。
         stringstream vs(str_val);
         vs >> val;
 
+        // 几何参数：允许配置文件显式给出，但最终仍会按
+        // sector_count * page_per_sector * page_size 重新归一化。
         if (key == "PAGE_SIZE") cfg.page_size = (int)val;
         else if (key == "PAGE_PER_SECTOR") cfg.page_per_sector = (int)val;
         else if (key == "SECTOR_COUNT") cfg.sector_count = (int)val;
         else if (key == "TOTAL_PAGES") cfg.total_pages = (int)val;
         else if (key == "MEMORY_SIZE") cfg.memory_size = (int)val;
+
+        // SPI 频率和片选间隔。
         else if (key == "F_C_MHZ") cfg.f_c_mhz = val;
         else if (key == "F_R_MHZ") cfg.f_r_mhz = val;
         else if (key == "T_SHSL_US") cfg.t_shsl_us = val;
+
+        // 命令内部周期，单位 us。
         else if (key == "T_READ_US") cfg.t_read_us = val;
         else if (key == "T_FAST_READ_US") cfg.t_fast_read_us = val;
         else if (key == "T_W_US") cfg.t_w_us = val;
@@ -76,12 +88,16 @@ FlashConfig load_config(const std::string& filename) {
         else if (key == "T_RES_US") cfg.t_res_us = val;
         else if (key == "T_VSL_US") cfg.t_vsl_us = val;
         else if (key == "T_PUW_US") cfg.t_puw_us = val;
+
+        // 仿真策略开关。
         else if (key == "USE_MAX_TIME") cfg.use_max_time = (int)val;
         else if (key == "AUTO_COMPLETE") cfg.auto_complete = (int)val;
         else if (key == "WRAP_ADDRESS") cfg.wrap_address = (int)val;
         else if (key == "STORAGE_FILE") cfg.storage_file = str_val;
     }
 
+    // 保证派生字段和基础几何字段一致，避免配置文件里的 TOTAL_PAGES/MEMORY_SIZE
+    // 与 sector/page 参数不一致时导致越界或容量错误。
     cfg.total_pages = cfg.sector_count * cfg.page_per_sector;
     cfg.memory_size = cfg.total_pages * cfg.page_size;
 

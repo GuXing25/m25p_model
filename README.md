@@ -33,3 +33,5 @@ make run
 ```
 
 默认配置文件为 `m25p.conf`，默认阵列文件为 `storage_m25p.bin`。
+
+该版本计入了FLASH接口、少数封装带来的约束。计入了状态寄存器、WEL
